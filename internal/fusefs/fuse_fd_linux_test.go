@@ -41,7 +41,7 @@ func TestReceiveFuseFD(t *testing.T) {
 		sendErr <- syscall.Sendmsg(int(file.Fd()), []byte{1}, syscall.UnixRights(int(source.Fd())), nil, 0)
 	}()
 
-	fd, err := receiveFuseFD(socketPath)
+	fd, err := receiveFuseFD(socketPath, DefaultFuseFDHandshakeTimeout)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -82,7 +82,7 @@ func TestReceiveFuseFDRejectsMessageWithoutDescriptor(t *testing.T) {
 		sendErr <- err
 	}()
 
-	if _, err := receiveFuseFD(socketPath); err == nil {
+	if _, err := receiveFuseFD(socketPath, DefaultFuseFDHandshakeTimeout); err == nil {
 		t.Fatal("receiveFuseFD unexpectedly succeeded without a descriptor")
 	}
 	if err := <-sendErr; err != nil {

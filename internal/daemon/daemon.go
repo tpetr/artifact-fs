@@ -85,22 +85,23 @@ const (
 )
 
 type Service struct {
-	root                 string
-	mountRoot            string
-	fuseFDSocket         string
-	hydrationConcurrency int
-	prepareTimeout       time.Duration
-	logger               *slog.Logger
-	registry             *registry.Store
-	git                  *gitstore.Store
-	mu                   sync.Mutex
-	running              map[model.RepoID]*repoRuntime
-	preparing            map[model.RepoID]int64
-	prepareAttempts      map[model.RepoID]int64
-	prepareSeq           int64
-	mountFailures        map[model.RepoID]*mountFailure
-	prepareWorkers       sync.WaitGroup
-	closing              bool
+	root                   string
+	mountRoot              string
+	fuseFDSocket           string
+	fuseFDHandshakeTimeout time.Duration
+	hydrationConcurrency   int
+	prepareTimeout         time.Duration
+	logger                 *slog.Logger
+	registry               *registry.Store
+	git                    *gitstore.Store
+	mu                     sync.Mutex
+	running                map[model.RepoID]*repoRuntime
+	preparing              map[model.RepoID]int64
+	prepareAttempts        map[model.RepoID]int64
+	prepareSeq             int64
+	mountFailures          map[model.RepoID]*mountFailure
+	prepareWorkers         sync.WaitGroup
+	closing                bool
 }
 
 type mountFailure struct {
@@ -242,6 +243,12 @@ func (s *Service) SetMountRoot(root string) {
 // responsibility (for example, a CSI node plugin).
 func (s *Service) SetFuseFDSocket(socket string) {
 	s.fuseFDSocket = strings.TrimSpace(socket)
+}
+
+// SetFuseFDHandshakeTimeout sets the externally managed FUSE descriptor
+// handshake timeout. A non-positive duration restores the package default.
+func (s *Service) SetFuseFDHandshakeTimeout(timeout time.Duration) {
+	s.fuseFDHandshakeTimeout = timeout
 }
 
 func (s *Service) SetHydrationConcurrency(n int) {
@@ -1148,7 +1155,8 @@ func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) erro
 
 func (s *Service) mountFS(cfg model.RepoConfig, resolver *fusefs.Resolver, engine *fusefs.Engine, gate *fusefs.ReadyGate) (fusefs.MountedFS, error) {
 	return fusefs.MountRepoWithOptions(cfg, resolver, engine, gate, fusefs.MountOptions{
-		FuseFDSocket: s.fuseFDSocket,
+		FuseFDSocket:           s.fuseFDSocket,
+		FuseFDHandshakeTimeout: s.fuseFDHandshakeTimeout,
 	})
 }
 

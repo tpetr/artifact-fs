@@ -177,6 +177,21 @@ func TestAddRepoAsyncCLIFlagValidation(t *testing.T) {
 	}
 }
 
+func TestDaemonCLIRejectsNonPositiveFuseFDHandshakeTimeout(t *testing.T) {
+	t.Setenv("ARTIFACT_FS_ROOT", t.TempDir())
+	var stdout, stderr bytes.Buffer
+	code := Run(context.Background(), []string{
+		"daemon",
+		"--fuse-fd-handshake-timeout", "0s",
+	}, &stdout, &stderr)
+	if code == 0 {
+		t.Fatalf("Run unexpectedly succeeded, stdout=%q", stdout.String())
+	}
+	if !strings.Contains(stderr.String(), "--fuse-fd-handshake-timeout must be positive") {
+		t.Fatalf("stderr = %q, want handshake timeout validation error", stderr.String())
+	}
+}
+
 func TestAddRepoCLIPersistsExplicitMountPath(t *testing.T) {
 	t.Setenv("ARTIFACT_FS_ROOT", t.TempDir())
 	var stdout, stderr bytes.Buffer

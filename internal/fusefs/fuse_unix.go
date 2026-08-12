@@ -31,12 +31,19 @@ type MountedFS interface {
 // such as a CSI node plugin, must tear it down instead.
 var ErrExternalMountManaged = errors.New("FUSE mount is externally managed")
 
+// DefaultFuseFDHandshakeTimeout bounds connection to an external FUSE FD
+// socket and receipt of its descriptor.
+const DefaultFuseFDHandshakeTimeout = 30 * time.Second
+
 // MountOptions controls the transport used to attach ArtifactFS to a FUSE
 // filesystem. The zero value performs ArtifactFS's normal local mount.
 type MountOptions struct {
 	// FuseFDSocket is a Linux-only Unix socket that sends one already-mounted
 	// /dev/fuse descriptor using SCM_RIGHTS.
 	FuseFDSocket string
+	// FuseFDHandshakeTimeout bounds the external socket handshake. A non-positive
+	// value uses DefaultFuseFDHandshakeTimeout.
+	FuseFDHandshakeTimeout time.Duration
 }
 
 // ArtifactFuse is the FUSE adapter following the tigrisfs GoofysFuse pattern:
@@ -1179,7 +1186,11 @@ func MountRepoWithOptions(repo model.RepoConfig, resolver *Resolver, engine *Eng
 	socketPath := strings.TrimSpace(options.FuseFDSocket)
 	externallyManaged := socketPath != ""
 	if externallyManaged {
-		fd, err := receiveFuseFD(socketPath)
+		handshakeTimeout := options.FuseFDHandshakeTimeout
+		if handshakeTimeout <= 0 {
+			handshakeTimeout = DefaultFuseFDHandshakeTimeout
+		}
+		fd, err := receiveFuseFD(socketPath, handshakeTimeout)
 		if err != nil {
 			return nil, fmt.Errorf("receive FUSE descriptor from %s: %w", socketPath, err)
 		}

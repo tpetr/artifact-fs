@@ -9,13 +9,11 @@ import (
 	"time"
 )
 
-const fuseFDHandshakeTimeout = 30 * time.Second
-
 // receiveFuseFD receives exactly one file descriptor over socketPath. The
 // descriptor is owned by the caller on success; fuse.Mount takes ownership
 // when it is passed through its /dev/fd/N mount path.
-func receiveFuseFD(socketPath string) (int, error) {
-	conn, err := net.DialTimeout("unix", socketPath, fuseFDHandshakeTimeout)
+func receiveFuseFD(socketPath string, timeout time.Duration) (int, error) {
+	conn, err := net.DialTimeout("unix", socketPath, timeout)
 	if err != nil {
 		return -1, err
 	}
@@ -25,7 +23,7 @@ func receiveFuseFD(socketPath string) (int, error) {
 	if !ok {
 		return -1, fmt.Errorf("expected Unix socket connection, got %T", conn)
 	}
-	if err := unixConn.SetReadDeadline(time.Now().Add(fuseFDHandshakeTimeout)); err != nil {
+	if err := unixConn.SetReadDeadline(time.Now().Add(timeout)); err != nil {
 		return -1, fmt.Errorf("set descriptor receive deadline: %w", err)
 	}
 

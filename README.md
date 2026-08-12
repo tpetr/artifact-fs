@@ -190,8 +190,10 @@ artifact-fs daemon \
 ```
 
 `--fuse-fd-socket` is Linux-only and expects exactly one descriptor sent with
-`SCM_RIGHTS`. It is intended for one externally managed mount per daemon. The
-socket's owner remains responsible for unmounting; `remove-repo`, remounting,
+`SCM_RIGHTS`. `--fuse-fd-handshake-timeout` controls the socket connection and
+descriptor receive deadline, defaulting to 30 seconds. This is intended for one
+externally managed mount per daemon. The socket's owner remains responsible for
+unmounting; `remove-repo`, remounting,
 and configuration changes cannot detach that mount while ArtifactFS is still
 running. `--mount-path` must be the actual path exposed by the external mount,
 not a private staging directory.

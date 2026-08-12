@@ -13,6 +13,7 @@ import (
 
 	"github.com/cloudflare/artifact-fs/internal/auth"
 	"github.com/cloudflare/artifact-fs/internal/daemon"
+	"github.com/cloudflare/artifact-fs/internal/fusefs"
 	"github.com/cloudflare/artifact-fs/internal/logging"
 	"github.com/cloudflare/artifact-fs/internal/model"
 	ucli "github.com/urfave/cli"
@@ -38,6 +39,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 			Flags: []ucli.Flag{
 				ucli.StringFlag{Name: "root", Value: filepath.Join(root, "mnt"), Usage: "mount root directory"},
 				ucli.StringFlag{Name: "fuse-fd-socket", Usage: "Linux: Unix socket that passes an already-mounted FUSE file descriptor"},
+				ucli.DurationFlag{Name: "fuse-fd-handshake-timeout", Value: fusefs.DefaultFuseFDHandshakeTimeout, Usage: "maximum wait for a FUSE descriptor from --fuse-fd-socket"},
 				ucli.IntFlag{Name: "hydration-concurrency", Value: daemon.DefaultHydrationConcurrency, Usage: "number of concurrent blob hydration workers"},
 			},
 			Action: func(c *ucli.Context) error {
@@ -49,6 +51,10 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				defer svc.Close()
 				svc.SetMountRoot(c.String("root"))
 				svc.SetFuseFDSocket(c.String("fuse-fd-socket"))
+				if c.Duration("fuse-fd-handshake-timeout") <= 0 {
+					return fmt.Errorf("--fuse-fd-handshake-timeout must be positive")
+				}
+				svc.SetFuseFDHandshakeTimeout(c.Duration("fuse-fd-handshake-timeout"))
 				svc.SetHydrationConcurrency(c.Int("hydration-concurrency"))
 				err = svc.Start(ctx)
 				if err == context.Canceled {
