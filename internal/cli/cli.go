@@ -37,6 +37,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 			Usage: "start the artifact-fs daemon",
 			Flags: []ucli.Flag{
 				ucli.StringFlag{Name: "root", Value: filepath.Join(root, "mnt"), Usage: "mount root directory"},
+				ucli.StringFlag{Name: "fuse-fd-socket", Usage: "Linux: Unix socket that passes an already-mounted FUSE file descriptor"},
 				ucli.IntFlag{Name: "hydration-concurrency", Value: daemon.DefaultHydrationConcurrency, Usage: "number of concurrent blob hydration workers"},
 			},
 			Action: func(c *ucli.Context) error {
@@ -47,6 +48,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				}
 				defer svc.Close()
 				svc.SetMountRoot(c.String("root"))
+				svc.SetFuseFDSocket(c.String("fuse-fd-socket"))
 				svc.SetHydrationConcurrency(c.Int("hydration-concurrency"))
 				err = svc.Start(ctx)
 				if err == context.Canceled {
@@ -67,6 +69,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				ucli.IntFlag{Name: "depth", Usage: "history depth to transfer; 0 transfers complete history"},
 				ucli.StringFlag{Name: "refresh", Value: "30s", Usage: "remote refresh interval or never"},
 				ucli.StringFlag{Name: "mount-root", Usage: "override mount root"},
+				ucli.StringFlag{Name: "mount-path", Usage: "explicit mount path (instead of <mount-root>/<name>)"},
 				ucli.BoolFlag{Name: "async", Usage: "return after registration and prepare the repo in the daemon"},
 				ucli.BoolFlag{Name: "prepared-gitdir", Usage: "use an existing git dir for async preparation"},
 				ucli.StringFlag{Name: "git-dir", Usage: "explicit git dir path"},
@@ -86,6 +89,9 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				requiredCommit := strings.TrimSpace(c.String("require-commit"))
 				if requiredCommit != "" && !c.IsSet("ref") && !c.IsSet("branch") {
 					return fmt.Errorf("--require-commit requires an explicit --ref")
+				}
+				if c.IsSet("mount-root") && c.IsSet("mount-path") {
+					return fmt.Errorf("--mount-root and --mount-path cannot be used together")
 				}
 				async := c.Bool("async")
 				preparedGitDir := c.Bool("prepared-gitdir")
@@ -116,6 +122,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 					HistoryDepth:          c.Int("depth"),
 					RemoteRefreshDisabled: strings.EqualFold(refreshValue, "never"),
 					MountRoot:             c.String("mount-root"),
+					MountPath:             c.String("mount-path"),
 					GitDir:                c.String("git-dir"),
 					PreparedGitDir:        preparedGitDir,
 					FetchRef:              c.String("fetch-ref"),

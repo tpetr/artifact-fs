@@ -87,6 +87,7 @@ const (
 type Service struct {
 	root                 string
 	mountRoot            string
+	fuseFDSocket         string
 	hydrationConcurrency int
 	prepareTimeout       time.Duration
 	logger               *slog.Logger
@@ -233,6 +234,14 @@ func (s *Service) SetMountRoot(root string) {
 	if strings.TrimSpace(root) != "" {
 		s.mountRoot = root
 	}
+}
+
+// SetFuseFDSocket configures a Linux-only, externally managed FUSE mount.
+// The socket must deliver one already-mounted /dev/fuse descriptor using
+// SCM_RIGHTS. Its kernel mount and unmount lifecycle remain the caller's
+// responsibility (for example, a CSI node plugin).
+func (s *Service) SetFuseFDSocket(socket string) {
+	s.fuseFDSocket = strings.TrimSpace(socket)
 }
 
 func (s *Service) SetHydrationConcurrency(n int) {
@@ -1031,7 +1040,7 @@ func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
 		Hydrator: h,
 	}
 
-	mfs, err := fusefs.MountRepo(cfg, resolver, engine)
+	mfs, err := s.mountFS(cfg, resolver, engine, nil)
 	if err != nil {
 		s.logger.Error("fuse mount failed, runtime will retry", "repo", cfg.Name, "error", err)
 		mfs = nil
@@ -1101,7 +1110,7 @@ func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) erro
 		Hydrator: h,
 	}
 
-	mfs, err := fusefs.MountRepoWithGate(cfg, resolver, engine, gate)
+	mfs, err := s.mountFS(cfg, resolver, engine, gate)
 	if err != nil {
 		s.logger.Error("fuse mount failed, runtime will retry", "repo", cfg.Name, "error", err)
 		mfs = nil
@@ -1135,6 +1144,12 @@ func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) erro
 	}
 	s.startRuntime(rt)
 	return nil
+}
+
+func (s *Service) mountFS(cfg model.RepoConfig, resolver *fusefs.Resolver, engine *fusefs.Engine, gate *fusefs.ReadyGate) (fusefs.MountedFS, error) {
+	return fusefs.MountRepoWithOptions(cfg, resolver, engine, gate, fusefs.MountOptions{
+		FuseFDSocket: s.fuseFDSocket,
+	})
 }
 
 func (s *Service) startPrepareWorker(ctx context.Context, cfg model.RepoConfig) {
@@ -2046,7 +2061,7 @@ func (s *Service) retryRuntimeMount(rt *repoRuntime) {
 	s.mu.Unlock()
 	defer rt.mounts.Done()
 
-	mfs, err := fusefs.MountRepoWithGate(cfg, resolver, engine, gate)
+	mfs, err := s.mountFS(cfg, resolver, engine, gate)
 	s.mu.Lock()
 	if err != nil {
 		mf = s.mountFailures[cfg.ID]

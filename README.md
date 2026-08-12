@@ -172,6 +172,30 @@ git -C /tmp/workers-sdk remote add origin https://github.com/cloudflare/workers-
   --fetch-ref main
 ```
 
+### Externally managed Linux FUSE mounts
+
+When a privileged component has already mounted FUSE and passes its `/dev/fuse`
+descriptor over a Unix socket (for example, a CSI node plugin), ArtifactFS can
+serve that descriptor directly without `fusermount3`:
+
+```sh
+artifact-fs add-repo \
+  --name repo \
+  --remote https://github.com/example/repo.git \
+  --mount-path /workspace \
+  --async
+
+artifact-fs daemon \
+  --fuse-fd-socket /fuse-fd-passing/workspace.sock
+```
+
+`--fuse-fd-socket` is Linux-only and expects exactly one descriptor sent with
+`SCM_RIGHTS`. It is intended for one externally managed mount per daemon. The
+socket's owner remains responsible for unmounting; `remove-repo`, remounting,
+and configuration changes cannot detach that mount while ArtifactFS is still
+running. `--mount-path` must be the actual path exposed by the external mount,
+not a private staging directory.
+
 ## Verified shallow sources
 
 Use a verified source when a job must inspect the exact revision selected for a deployment:

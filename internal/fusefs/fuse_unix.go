@@ -26,6 +26,19 @@ type MountedFS interface {
 	Unmount() error
 }
 
+// ErrExternalMountManaged is returned when an externally managed mount is
+// asked to unmount through ArtifactFS. The component that created the mount,
+// such as a CSI node plugin, must tear it down instead.
+var ErrExternalMountManaged = errors.New("FUSE mount is externally managed")
+
+// MountOptions controls the transport used to attach ArtifactFS to a FUSE
+// filesystem. The zero value performs ArtifactFS's normal local mount.
+type MountOptions struct {
+	// FuseFDSocket is a Linux-only Unix socket that sends one already-mounted
+	// /dev/fuse descriptor using SCM_RIGHTS.
+	FuseFDSocket string
+}
+
 // ArtifactFuse is the FUSE adapter following the tigrisfs GoofysFuse pattern:
 // embed NotImplementedFileSystem + core state, thin operation wrappers.
 type ArtifactFuse struct {
@@ -1128,10 +1141,14 @@ func (fs *ArtifactFuse) RemoveXattr(_ context.Context, _ *fuseops.RemoveXattrOp)
 
 type mountedFSWrapper struct {
 	*fuse.MountedFileSystem
-	mountPoint string
+	mountPoint        string
+	externallyManaged bool
 }
 
 func (m *mountedFSWrapper) Unmount() error {
+	if m.externallyManaged {
+		return ErrExternalMountManaged
+	}
 	return TryUnmount(m.mountPoint)
 }
 
@@ -1140,6 +1157,12 @@ func MountRepo(repo model.RepoConfig, resolver *Resolver, engine *Engine) (Mount
 }
 
 func MountRepoWithGate(repo model.RepoConfig, resolver *Resolver, engine *Engine, gate *ReadyGate) (MountedFS, error) {
+	return MountRepoWithOptions(repo, resolver, engine, gate, MountOptions{})
+}
+
+// MountRepoWithOptions mounts ArtifactFS using either its normal local FUSE
+// mount or a FUSE descriptor supplied by an external mount manager.
+func MountRepoWithOptions(repo model.RepoConfig, resolver *Resolver, engine *Engine, gate *ReadyGate, options MountOptions) (MountedFS, error) {
 	fsint := NewArtifactFuse(repo, resolver, engine)
 	server := fuseutil.NewFileSystemServer(NewGatedFileSystem(fsint, gate))
 
@@ -1152,12 +1175,29 @@ func MountRepoWithGate(repo model.RepoConfig, resolver *Resolver, engine *Engine
 	// READDIRPLUS would cache unknown blob sizes as zero before lookup can hydrate them.
 	platformMountConfig(mountCfg)
 
-	mfs, err := fuse.Mount(repo.MountPath, server, mountCfg)
+	mountTarget := repo.MountPath
+	socketPath := strings.TrimSpace(options.FuseFDSocket)
+	externallyManaged := socketPath != ""
+	if externallyManaged {
+		fd, err := receiveFuseFD(socketPath)
+		if err != nil {
+			return nil, fmt.Errorf("receive FUSE descriptor from %s: %w", socketPath, err)
+		}
+		// jacobsa/fuse treats /dev/fd/N as an already-mounted FUSE channel and
+		// skips both mount(2) and fusermount.
+		mountTarget = fmt.Sprintf("/dev/fd/%d", fd)
+	}
+
+	mfs, err := fuse.Mount(mountTarget, server, mountCfg)
 	if err != nil {
 		return nil, fmt.Errorf("fuse mount %s: %w", repo.MountPath, err)
 	}
 
-	return &mountedFSWrapper{MountedFileSystem: mfs, mountPoint: repo.MountPath}, nil
+	return &mountedFSWrapper{
+		MountedFileSystem: mfs,
+		mountPoint:        repo.MountPath,
+		externallyManaged: externallyManaged,
+	}, nil
 }
 
 func TryUnmount(mountPoint string) error {

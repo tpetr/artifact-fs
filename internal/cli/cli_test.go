@@ -156,6 +156,11 @@ func TestAddRepoAsyncCLIFlagValidation(t *testing.T) {
 			args: []string{"add-repo", "--name", "repo", "--async", "--remote", "https://github.com/example/repo.git", "--ref", "refs/heads/main", "--branch", "main"},
 			want: "--ref and --branch cannot be used together",
 		},
+		{
+			name: "mount_path_conflicts_with_mount_root",
+			args: []string{"add-repo", "--name", "repo", "--async", "--remote", "https://github.com/example/repo.git", "--mount-root", "/mnt", "--mount-path", "/workspace"},
+			want: "--mount-root and --mount-path cannot be used together",
+		},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
@@ -169,6 +174,29 @@ func TestAddRepoAsyncCLIFlagValidation(t *testing.T) {
 				t.Fatalf("stderr = %q, want substring %q", stderr.String(), tt.want)
 			}
 		})
+	}
+}
+
+func TestAddRepoCLIPersistsExplicitMountPath(t *testing.T) {
+	t.Setenv("ARTIFACT_FS_ROOT", t.TempDir())
+	var stdout, stderr bytes.Buffer
+	if code := Run(context.Background(), []string{
+		"add-repo",
+		"--name", "repo",
+		"--remote", "https://github.com/example/repo.git",
+		"--mount-path", "/workspace",
+		"--async",
+	}, &stdout, &stderr); code != 0 {
+		t.Fatalf("add-repo exit = %d, stderr=%q", code, stderr.String())
+	}
+
+	stdout.Reset()
+	stderr.Reset()
+	if code := Run(context.Background(), []string{"list-repos"}, &stdout, &stderr); code != 0 {
+		t.Fatalf("list-repos exit = %d, stderr=%q", code, stderr.String())
+	}
+	if !strings.Contains(stdout.String(), "\t/workspace\t") {
+		t.Fatalf("list-repos output = %q, want explicit mount path", stdout.String())
 	}
 }
 
