@@ -786,6 +786,30 @@ func TestFetchRefNonInteractiveAndPrepareFetchedBranch(t *testing.T) {
 	}
 }
 
+func TestPrepareTrustedPreparedGitDirRejectsMismatchAndMissingRef(t *testing.T) {
+	t.Parallel()
+	tmp := t.TempDir()
+	repo := filepath.Join(tmp, "repo")
+	run(t, "git", "init", "--initial-branch", "main", repo)
+	run(t, "git", "-C", repo, "config", "user.name", "test")
+	run(t, "git", "-C", repo, "config", "user.email", "test@example.com")
+	if err := os.WriteFile(filepath.Join(repo, "README.md"), []byte("hello\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(t, "git", "-C", repo, "add", "README.md")
+	run(t, "git", "-C", repo, "commit", "-m", "init")
+	oid := strings.TrimSpace(runOutput(t, "git", "-C", repo, "rev-parse", "HEAD"))
+	cfg := model.RepoConfig{ID: "trusted", Name: "trusted", GitDir: filepath.Join(repo, ".git"), PreparedGitDir: true}
+	store := New(nil)
+
+	if _, err := store.PrepareTrustedPreparedGitDir(context.Background(), cfg, "refs/heads/main", strings.Repeat("a", 40)); err == nil || !strings.Contains(err.Error(), "regenerate the verified prepared Git dir") {
+		t.Fatalf("mismatch error = %v", err)
+	}
+	if _, err := store.PrepareTrustedPreparedGitDir(context.Background(), cfg, "refs/heads/missing", oid); err == nil || !strings.Contains(err.Error(), "missing requested ref") {
+		t.Fatalf("missing-ref error = %v", err)
+	}
+}
+
 func TestPrepareFetchedBranchRefusesPreparedGitDirRewind(t *testing.T) {
 	t.Parallel()
 	tmp := t.TempDir()

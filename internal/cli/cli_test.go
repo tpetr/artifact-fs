@@ -127,6 +127,31 @@ func TestAddRepoAsyncCLIFlagValidation(t *testing.T) {
 			want: "--git-dir is required with --prepared-gitdir",
 		},
 		{
+			name: "verified_prepared_requires_prepared_gitdir",
+			args: []string{"add-repo", "--name", "repo", "--async", "--prepared-gitdir-verified", "--prepared-commit", "0123456789012345678901234567890123456789", "--ref", "refs/heads/main"},
+			want: "--prepared-gitdir-verified requires --prepared-gitdir",
+		},
+		{
+			name: "verified_prepared_requires_explicit_canonical_ref",
+			args: []string{"add-repo", "--name", "repo", "--async", "--prepared-gitdir", "--git-dir", "/tmp/repo.git", "--prepared-gitdir-verified", "--prepared-commit", "0123456789012345678901234567890123456789"},
+			want: "--prepared-gitdir-verified requires an explicit canonical --ref",
+		},
+		{
+			name: "verified_prepared_requires_expected_commit",
+			args: []string{"add-repo", "--name", "repo", "--async", "--prepared-gitdir", "--git-dir", "/tmp/repo.git", "--prepared-gitdir-verified", "--ref", "refs/heads/main"},
+			want: "--prepared-gitdir-verified requires --prepared-commit",
+		},
+		{
+			name: "verified_prepared_rejects_abbreviated_commit",
+			args: []string{"add-repo", "--name", "repo", "--async", "--prepared-gitdir", "--git-dir", "/tmp/repo.git", "--prepared-gitdir-verified", "--prepared-commit", "0123456", "--ref", "refs/heads/main"},
+			want: "--prepared-commit must be a full",
+		},
+		{
+			name: "prepared_commit_requires_verified_mode",
+			args: []string{"add-repo", "--name", "repo", "--async", "--prepared-commit", "0123456789012345678901234567890123456789"},
+			want: "--prepared-commit requires --prepared-gitdir-verified",
+		},
+		{
 			name: "async_clone_requires_remote",
 			args: []string{"add-repo", "--name", "repo", "--async"},
 			want: "--remote is required",

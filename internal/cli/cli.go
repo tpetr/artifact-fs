@@ -69,6 +69,8 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				ucli.StringFlag{Name: "mount-root", Usage: "override mount root"},
 				ucli.BoolFlag{Name: "async", Usage: "return after registration and prepare the repo in the daemon"},
 				ucli.BoolFlag{Name: "prepared-gitdir", Usage: "use an existing git dir for async preparation"},
+				ucli.BoolFlag{Name: "prepared-gitdir-verified", Usage: "trust an independently verified prepared git dir; requires --prepared-commit and explicit canonical --ref"},
+				ucli.StringFlag{Name: "prepared-commit", Usage: "full expected 40- or 64-character commit OID for --prepared-gitdir-verified"},
 				ucli.StringFlag{Name: "git-dir", Usage: "explicit git dir path"},
 				ucli.StringFlag{Name: "fetch-ref", Usage: "ref to fetch during async preparation"},
 			},
@@ -89,11 +91,26 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				}
 				async := c.Bool("async")
 				preparedGitDir := c.Bool("prepared-gitdir")
+				preparedGitDirVerified := c.Bool("prepared-gitdir-verified")
+				preparedCommit := strings.TrimSpace(c.String("prepared-commit"))
 				if preparedGitDir && !async {
 					return fmt.Errorf("--prepared-gitdir requires --async")
 				}
 				if preparedGitDir && strings.TrimSpace(c.String("git-dir")) == "" {
 					return fmt.Errorf("--git-dir is required with --prepared-gitdir")
+				}
+				if preparedGitDirVerified {
+					if !preparedGitDir {
+						return fmt.Errorf("--prepared-gitdir-verified requires --prepared-gitdir")
+					}
+					if !c.IsSet("ref") || !strings.HasPrefix(ref, "refs/") {
+						return fmt.Errorf("--prepared-gitdir-verified requires an explicit canonical --ref")
+					}
+					if preparedCommit == "" {
+						return fmt.Errorf("--prepared-gitdir-verified requires --prepared-commit")
+					}
+				} else if preparedCommit != "" {
+					return fmt.Errorf("--prepared-commit requires --prepared-gitdir-verified")
 				}
 				if name == "" {
 					return fmt.Errorf("--name is required")
@@ -107,19 +124,21 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 					return err
 				}
 				cfg := model.RepoConfig{
-					Name:                  name,
-					ID:                    model.RepoID(name),
-					RemoteURL:             remote,
-					Branch:                ref,
-					RefreshInterval:       d,
-					RequiredCommit:        requiredCommit,
-					HistoryDepth:          c.Int("depth"),
-					RemoteRefreshDisabled: strings.EqualFold(refreshValue, "never"),
-					MountRoot:             c.String("mount-root"),
-					GitDir:                c.String("git-dir"),
-					PreparedGitDir:        preparedGitDir,
-					FetchRef:              c.String("fetch-ref"),
-					Enabled:               true,
+					Name:                   name,
+					ID:                     model.RepoID(name),
+					RemoteURL:              remote,
+					Branch:                 ref,
+					RefreshInterval:        d,
+					RequiredCommit:         requiredCommit,
+					HistoryDepth:           c.Int("depth"),
+					RemoteRefreshDisabled:  strings.EqualFold(refreshValue, "never"),
+					MountRoot:              c.String("mount-root"),
+					GitDir:                 c.String("git-dir"),
+					PreparedGitDir:         preparedGitDir,
+					PreparedGitDirVerified: preparedGitDirVerified,
+					PreparedCommit:         preparedCommit,
+					FetchRef:               c.String("fetch-ref"),
+					Enabled:                true,
 				}
 				if err := svc.AddRepoWithOptions(ctx, cfg, daemon.AddRepoOptions{Async: async}); err != nil {
 					return err
