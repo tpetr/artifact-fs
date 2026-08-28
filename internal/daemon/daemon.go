@@ -47,10 +47,11 @@ const (
 	prepareModeSync  = "sync"
 	prepareModeAsync = "async"
 
-	prepareSourceFreshClone     = "fresh_clone"
-	prepareSourceExistingClone  = "existing_clone"
-	prepareSourcePreparedGitDir = "prepared_git_dir"
-	prepareSourceVerified       = "verified_source"
+	prepareSourceFreshClone            = "fresh_clone"
+	prepareSourceExistingClone         = "existing_clone"
+	prepareSourcePreparedGitDir        = "prepared_gitdir"
+	prepareSourceTrustedPreparedGitDir = "prepared_gitdir_verified"
+	prepareSourceVerified              = "verified_source"
 
 	preparePhaseUnknown           = "unknown"
 	preparePhaseValidate          = "validate"
@@ -446,6 +447,8 @@ func samePrepareConfig(a model.RepoConfig, b model.RepoConfig) bool {
 		a.HistoryDepth == b.HistoryDepth &&
 		a.RemoteRefreshDisabled == b.RemoteRefreshDisabled &&
 		a.PreparedGitDir == b.PreparedGitDir &&
+		a.PreparedGitDirVerified == b.PreparedGitDirVerified &&
+		a.PreparedCommit == b.PreparedCommit &&
 		a.FetchRef == b.FetchRef &&
 		a.GitDir == b.GitDir &&
 		a.MetaDBPath == b.MetaDBPath &&
@@ -464,18 +467,26 @@ func normalizeSourceConfig(cfg *model.RepoConfig) error {
 		cfg.Branch = "refs/heads/" + cfg.Branch
 	}
 	cfg.RequiredCommit = strings.ToLower(strings.TrimSpace(cfg.RequiredCommit))
+	cfg.PreparedCommit = strings.ToLower(strings.TrimSpace(cfg.PreparedCommit))
 	if cfg.HistoryDepth < 0 {
 		return errors.New("--depth must not be negative")
 	}
-	if cfg.RequiredCommit == "" {
+	if err := validateFullCommitOID(cfg.RequiredCommit, "--require-commit"); err != nil {
+		return err
+	}
+	return validateFullCommitOID(cfg.PreparedCommit, "--prepared-commit")
+}
+
+func validateFullCommitOID(oid string, flag string) error {
+	if oid == "" {
 		return nil
 	}
-	if len(cfg.RequiredCommit) != 40 && len(cfg.RequiredCommit) != 64 {
-		return errors.New("--require-commit must be a full 40- or 64-character commit OID")
+	if len(oid) != 40 && len(oid) != 64 {
+		return fmt.Errorf("%s must be a full 40- or 64-character commit OID", flag)
 	}
-	for _, character := range cfg.RequiredCommit {
+	for _, character := range oid {
 		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
-			return errors.New("--require-commit must be hexadecimal")
+			return fmt.Errorf("%s must be hexadecimal", flag)
 		}
 	}
 	return nil
@@ -499,6 +510,7 @@ func (s *Service) AddRepo(ctx context.Context, cfg model.RepoConfig) error {
 }
 
 func (s *Service) AddRepoWithOptions(ctx context.Context, cfg model.RepoConfig, opts AddRepoOptions) error {
+	canonicalRefProvided := strings.HasPrefix(strings.TrimSpace(cfg.Branch), "refs/")
 	if err := model.ValidateRepoName(cfg.Name); err != nil {
 		return err
 	}
@@ -524,6 +536,26 @@ func (s *Service) AddRepoWithOptions(ctx context.Context, cfg model.RepoConfig, 
 	}
 	if cfg.PreparedGitDir && cfg.RequiredCommit != "" {
 		return fmt.Errorf("--prepared-gitdir is not supported with --require-commit")
+	}
+	if cfg.PreparedCommit != "" && !cfg.PreparedGitDirVerified {
+		return fmt.Errorf("--prepared-commit requires --prepared-gitdir-verified")
+	}
+	if cfg.PreparedGitDirVerified {
+		if !cfg.PreparedGitDir {
+			return fmt.Errorf("--prepared-gitdir-verified requires --prepared-gitdir")
+		}
+		if !opts.Async {
+			return fmt.Errorf("--prepared-gitdir-verified requires --async")
+		}
+		if !canonicalRefProvided {
+			return fmt.Errorf("--prepared-gitdir-verified requires a canonical --ref")
+		}
+		if cfg.PreparedCommit == "" {
+			return fmt.Errorf("--prepared-gitdir-verified requires --prepared-commit")
+		}
+		if cfg.RequiredCommit != "" {
+			return fmt.Errorf("--prepared-gitdir-verified is not supported with --require-commit")
+		}
 	}
 	if opts.Async {
 		if strings.TrimSpace(cfg.RemoteURL) == "" && !cfg.PreparedGitDir {
@@ -1225,6 +1257,8 @@ func (s *Service) runPrepareAttempt(ctx context.Context, cfg model.RepoConfig, a
 	source := prepareSourceFreshClone
 	if cfg.RequiredCommit != "" {
 		source = prepareSourceVerified
+	} else if cfg.PreparedGitDirVerified {
+		source = prepareSourceTrustedPreparedGitDir
 	} else if cfg.PreparedGitDir {
 		source = prepareSourcePreparedGitDir
 	} else if _, err := os.Stat(cfg.GitDir); err == nil {
@@ -1237,14 +1271,14 @@ func (s *Service) runPrepareAttempt(ctx context.Context, cfg model.RepoConfig, a
 		timeoutMS = max(time.Until(deadline).Milliseconds(), 0)
 	}
 	logger := s.logger.With("repo", safeRepo, "mode", prepareModeAsync, "attempt", attempt)
-	logger.InfoContext(ctx, logRepoPreparationStarted, "source", source, "phase", preparePhaseValidate, "state", prepareLogStateStarted, "duration_ms", 0, "branch", safeBranch, "fetch_ref", safeFetchRef, "deadline_set", deadlineSet, "timeout_ms", timeoutMS)
+	logger.InfoContext(ctx, logRepoPreparationStarted, "source", source, "phase", preparePhaseValidate, "state", prepareLogStateStarted, "duration_ms", 0, "branch", safeBranch, "fetch_ref", safeFetchRef, "ref", safeBranch, "expected_commit", auth.RedactLogString(cfg.PreparedCommit), "resolved_commit", "", "upstream_preparation_skipped", cfg.PreparedGitDirVerified, "deadline_set", deadlineSet, "timeout_ms", timeoutMS)
 
 	var headOID, headRef string
 	var gen int64
 	defer func() {
 		durationMS := time.Since(started).Milliseconds()
 		if retErr == nil {
-			logger.InfoContext(ctx, logRepoPreparationCompleted, "source", source, "phase", preparePhaseComplete, "state", prepareLogStateCompleted, "duration_ms", durationMS, "deadline_set", deadlineSet, "timeout_ms", timeoutMS, "head_oid", auth.RedactLogString(headOID), "head_ref", auth.RedactLogString(headRef), "snapshot_generation", gen)
+			logger.InfoContext(ctx, logRepoPreparationCompleted, "source", source, "phase", preparePhaseComplete, "state", prepareLogStateCompleted, "duration_ms", durationMS, "ref", safeBranch, "expected_commit", auth.RedactLogString(cfg.PreparedCommit), "resolved_commit", auth.RedactLogString(headOID), "upstream_preparation_skipped", cfg.PreparedGitDirVerified, "deadline_set", deadlineSet, "timeout_ms", timeoutMS, "head_oid", auth.RedactLogString(headOID), "head_ref", auth.RedactLogString(headRef), "snapshot_generation", gen)
 			return
 		}
 		timedOut := errors.Is(retErr, context.DeadlineExceeded) || errors.Is(ctx.Err(), context.DeadlineExceeded)
@@ -1253,7 +1287,7 @@ func (s *Service) runPrepareAttempt(ctx context.Context, cfg model.RepoConfig, a
 		if canceled && !timedOut {
 			state = prepareLogStateCanceled
 		}
-		args := []any{"source", source, "phase", phase, "state", state, "duration_ms", durationMS, "deadline_set", deadlineSet, "timeout_ms", timeoutMS, "timed_out", timedOut, "canceled", canceled, "error", auth.RedactLogString(retErr.Error(), cfg.RemoteURL)}
+		args := []any{"source", source, "phase", phase, "state", state, "duration_ms", durationMS, "ref", safeBranch, "expected_commit", auth.RedactLogString(cfg.PreparedCommit), "resolved_commit", auth.RedactLogString(headOID), "upstream_preparation_skipped", cfg.PreparedGitDirVerified, "deadline_set", deadlineSet, "timeout_ms", timeoutMS, "timed_out", timedOut, "canceled", canceled, "error", auth.RedactLogString(retErr.Error(), cfg.RemoteURL)}
 		if canceled && !timedOut {
 			logger.InfoContext(ctx, logRepoPreparationCanceled, args...)
 			return
@@ -1325,13 +1359,22 @@ func (s *Service) runPrepareAttempt(ctx context.Context, cfg model.RepoConfig, a
 				if err := s.git.ValidatePreparedGitDir(ctx, cfg); err != nil {
 					return fail(err)
 				}
-				phase = preparePhaseFetch
-				if err := s.git.FetchRefNonInteractive(ctx, cfg, cfg.FetchRef); err != nil {
-					return fail(err)
-				}
 				phase = preparePhaseUpdateBranch
-				if err := s.git.PrepareFetchedBranch(ctx, cfg, cfg.FetchRef); err != nil {
-					return fail(err)
+				if cfg.PreparedGitDirVerified {
+					resolved, err := s.git.PrepareTrustedPreparedGitDir(ctx, cfg, cfg.Branch, cfg.PreparedCommit)
+					if err != nil {
+						return fail(err)
+					}
+					headOID = resolved
+				} else {
+					phase = preparePhaseFetch
+					if err := s.git.FetchRefNonInteractive(ctx, cfg, cfg.FetchRef); err != nil {
+						return fail(err)
+					}
+					phase = preparePhaseUpdateBranch
+					if err := s.git.PrepareFetchedBranch(ctx, cfg, cfg.FetchRef); err != nil {
+						return fail(err)
+					}
 				}
 			} else {
 				phase = preparePhaseValidate
@@ -1366,6 +1409,9 @@ func (s *Service) runPrepareAttempt(ctx context.Context, cfg model.RepoConfig, a
 				return fail(err)
 			}
 			preparedSource = model.PreparedSource{Ref: headRef, Commit: headOID}
+			if cfg.PreparedGitDirVerified {
+				preparedSource = model.PreparedSource{Ref: cfg.Branch, Commit: headOID, Verified: true}
+			}
 		}
 		phase = preparePhaseOpenSnapshot
 		snap, closeSnap, err := s.snapshotForPrepare(ctx, cfg)
@@ -1864,7 +1910,7 @@ func (s *Service) readPersistedStatus(ctx context.Context, cfg model.RepoConfig)
 	if fi, err := os.Stat(filepath.Join(cfg.GitDir, "FETCH_HEAD")); err == nil {
 		// Verified acquisition itself writes FETCH_HEAD before its receipt.
 		// Only a newer mtime is evidence of a later remote refresh.
-		if cfg.RequiredCommit == "" || (!cfg.AcquiredAt.IsZero() && fi.ModTime().After(cfg.AcquiredAt)) {
+		if (cfg.RequiredCommit == "" && !cfg.PreparedGitDirVerified) || (!cfg.AcquiredAt.IsZero() && fi.ModTime().After(cfg.AcquiredAt)) {
 			st.LastFetchAt = fi.ModTime()
 			st.LastFetchResult = "ok"
 		}
@@ -1877,8 +1923,15 @@ func (s *Service) readPersistedStatus(ctx context.Context, cfg model.RepoConfig)
 func applySourceStatus(st *model.RepoRuntimeState, cfg model.RepoConfig) {
 	st.SourceRef = cfg.Branch
 	st.RequiredCommit = cfg.RequiredCommit
+	if cfg.PreparedGitDirVerified {
+		st.RequiredCommit = cfg.PreparedCommit
+	}
 	st.RemoteRefreshDisabled = cfg.RemoteRefreshDisabled
 	switch {
+	case cfg.PreparedGitDirVerified && cfg.AcquiredRef == cfg.Branch && strings.EqualFold(cfg.AcquiredCommit, cfg.PreparedCommit) && !cfg.AcquiredAt.IsZero():
+		st.Acquisition = "trusted_prepared"
+	case cfg.PreparedGitDirVerified:
+		st.Acquisition = "pending"
 	case cfg.RequiredCommit == "":
 		st.Acquisition = "not_required"
 	case cfg.AcquiredRef == cfg.Branch && strings.EqualFold(cfg.AcquiredCommit, cfg.RequiredCommit) && !cfg.AcquiredAt.IsZero():

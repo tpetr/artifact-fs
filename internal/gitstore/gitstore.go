@@ -981,6 +981,180 @@ func (s *Store) PrepareFetchedBranch(ctx context.Context, repo model.RepoConfig,
 	return nil
 }
 
+func readTrustedPreparedIndex(ctx context.Context, gitDir string, oid string) error {
+	// Do not use read-tree here: even without -u, its index merge machinery can
+	// lazily request promisor blobs. ls-tree emits the index-info wire format,
+	// so stream it directly into a fresh index instead. Both commands are
+	// explicitly local-only and raw paths remain NUL-delimited end-to-end.
+	indexPath, err := runGit(ctx, gitDir, "rev-parse", "--git-path", "index")
+	if err != nil {
+		return err
+	}
+	indexPath = strings.TrimSpace(indexPath)
+	tmp, err := os.CreateTemp(filepath.Dir(indexPath), ".trusted-index-*")
+	if err != nil {
+		return err
+	}
+	tmpPath := tmp.Name()
+	if err := tmp.Close(); err != nil {
+		_ = os.Remove(tmpPath)
+		return err
+	}
+	if err := os.Remove(tmpPath); err != nil {
+		return err
+	}
+	defer os.Remove(tmpPath)
+	env := []string{"GIT_DIR=" + gitDir, "GIT_INDEX_FILE=" + tmpPath, "GIT_NO_LAZY_FETCH=1"}
+	tree := exec.CommandContext(ctx, "git", "ls-tree", "-r", "-z", oid)
+	configureCancelableCommand(tree)
+	tree.Env = append(os.Environ(), env...)
+	index := exec.CommandContext(ctx, "git", "update-index", "-z", "--index-info")
+	configureCancelableCommand(index)
+	index.Env = append(os.Environ(), env...)
+	pipe, err := tree.StdoutPipe()
+	if err != nil {
+		return err
+	}
+	index.Stdin = pipe
+	var treeErr, indexErr bytes.Buffer
+	tree.Stderr = &treeErr
+	index.Stderr = &indexErr
+	if err := index.Start(); err != nil {
+		return err
+	}
+	if err := tree.Start(); err != nil {
+		_ = index.Process.Kill()
+		_ = index.Wait()
+		return err
+	}
+	treeWaitErr := tree.Wait()
+	indexWaitErr := index.Wait()
+	if treeWaitErr != nil {
+		return gitPipeError(treeWaitErr, treeErr.String())
+	}
+	if indexWaitErr != nil {
+		return gitPipeError(indexWaitErr, indexErr.String())
+	}
+	if err := os.Rename(tmpPath, indexPath); err != nil {
+		return err
+	}
+	return nil
+}
+
+func gitPipeError(commandErr error, stderr string) error {
+	if message := auth.RedactString(strings.TrimSpace(stderr)); message != "" {
+		return errors.New(message)
+	}
+	return commandErr
+}
+
+// PrepareTrustedPreparedGitDir installs the requested ref from an already
+// verified prepared Git directory. It deliberately performs only local Git
+// operations: callers that select this mode own the trust decision and must
+// have independently verified ref and expectedCommit before invoking us.
+func (s *Store) PrepareTrustedPreparedGitDir(ctx context.Context, repo model.RepoConfig, ref string, expectedCommit string) (string, error) {
+	ref = strings.TrimSpace(ref)
+	expectedCommit = strings.ToLower(strings.TrimSpace(expectedCommit))
+	if !strings.HasPrefix(ref, "refs/") {
+		return "", errors.New("trusted prepared git dir requires a canonical refs/... ref")
+	}
+	if _, err := runGit(ctx, repo.GitDir, "check-ref-format", ref); err != nil {
+		return "", fmt.Errorf("trusted prepared git dir requires a valid canonical ref %q", ref)
+	}
+	if err := validateFullCommitOID(expectedCommit); err != nil {
+		return "", err
+	}
+	target, err := trustedPreparedRefTarget(ctx, repo.GitDir, ref)
+	if err != nil {
+		return "", fmt.Errorf("prepared git dir is missing requested ref %s; regenerate the verified prepared Git dir: %w", ref, err)
+	}
+	oid, err := runGit(ctx, repo.GitDir, "rev-parse", "--verify", target+"^{commit}")
+	if err != nil {
+		return "", fmt.Errorf("prepared git dir requested ref %s does not resolve to a commit; regenerate the verified prepared Git dir: %w", ref, err)
+	}
+	oid = strings.ToLower(strings.TrimSpace(oid))
+	if oid != expectedCommit {
+		return "", fmt.Errorf("prepared git dir requested ref %s resolved to %s, expected %s; regenerate the verified prepared Git dir", ref, oid, expectedCommit)
+	}
+	if err := s.prepareLocalRef(ctx, repo, ref, oid); err != nil {
+		return "", err
+	}
+	return oid, nil
+}
+
+// trustedPreparedRefTarget resolves the locally available requested source
+// ref. A branch clone may retain either its local branch or origin tracking
+// ref after --no-checkout, so both are accepted; it never consults a remote.
+func trustedPreparedRefTarget(ctx context.Context, gitDir string, ref string) (string, error) {
+	candidates := []string{ref}
+	if branch := branchName(ref); branch != "" {
+		candidates = []string{"refs/heads/" + branch, "refs/remotes/origin/" + branch}
+	}
+	for _, candidate := range candidates {
+		if _, err := runGit(ctx, gitDir, "rev-parse", "--verify", candidate+"^{commit}"); err == nil {
+			return candidate, nil
+		}
+	}
+	return "", errors.New("ref not present locally")
+}
+
+func (s *Store) prepareLocalRef(ctx context.Context, repo model.RepoConfig, ref string, oid string) error {
+	oldOID, err := currentOrEmptyTreeOID(ctx, repo.GitDir)
+	if err != nil {
+		return err
+	}
+	branch := branchName(ref)
+	if branch == "" {
+		if err := readTrustedPreparedIndex(ctx, repo.GitDir, oid); err != nil {
+			return err
+		}
+		oldHeadOID, err := refOIDOrZero(ctx, repo.GitDir, "HEAD")
+		if err != nil {
+			return rollbackIndexTransition(ctx, repo.GitDir, oid, oldOID, err)
+		}
+		updateArgs := []string{"update-ref", "--no-deref", "HEAD", oid}
+		if strings.Trim(oldHeadOID, "0") != "" {
+			updateArgs = append(updateArgs, oldHeadOID)
+		}
+		if _, err := runGit(ctx, repo.GitDir, updateArgs...); err != nil {
+			return rollbackIndexTransition(ctx, repo.GitDir, oid, oldOID, err)
+		}
+		return nil
+	}
+	refName := "refs/heads/" + branch
+	oldBranchOID, err := s.preparedBranchExpectedOID(ctx, repo, branch, oid)
+	if err != nil {
+		return err
+	}
+	if err := readTrustedPreparedIndex(ctx, repo.GitDir, oid); err != nil {
+		return err
+	}
+	if _, err := runGit(ctx, repo.GitDir, "update-ref", refName, oid, oldBranchOID); err != nil {
+		return rollbackIndexTransition(ctx, repo.GitDir, oid, oldOID, err)
+	}
+	if _, err := runGit(ctx, repo.GitDir, "symbolic-ref", "HEAD", refName); err != nil {
+		refErr := restoreRef(ctx, repo.GitDir, refName, oldBranchOID, oid)
+		indexErr := rollbackIndexTransition(ctx, repo.GitDir, oid, oldOID, err)
+		return errors.Join(indexErr, refErr)
+	}
+	if _, err := runGit(ctx, repo.GitDir, "branch", "--set-upstream-to", "origin/"+branch, branch); err != nil {
+		s.logger.WarnContext(ctx, "set upstream failed", "repo", repo.Name, "error", err)
+	}
+	return nil
+}
+
+func validateFullCommitOID(oid string) error {
+	if len(oid) != 40 && len(oid) != 64 {
+		return errors.New("expected commit must be a full 40- or 64-character commit OID")
+	}
+	for _, character := range oid {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return errors.New("expected commit must be hexadecimal")
+		}
+	}
+	return nil
+}
+
 func refOIDOrZero(ctx context.Context, gitDir string, refName string) (string, error) {
 	oid, err := runGit(ctx, gitDir, "rev-parse", "--verify", refName+"^{commit}")
 	if err == nil {
@@ -1135,7 +1309,9 @@ func (s *Store) BuildTreeIndex(ctx context.Context, repo model.RepoConfig, headO
 func streamTreeRecords(ctx context.Context, gitDir string, headOID string, fn func(string)) error {
 	cmd := exec.CommandContext(ctx, "git", "ls-tree", "-r", "-t", "-z", headOID)
 	configureCancelableCommand(cmd)
-	cmd.Env = append(os.Environ(), "GIT_DIR="+gitDir)
+	// Tree enumeration is preparation metadata, never a reason to hydrate a
+	// promisor blob. Keep it local-only just like batch size resolution.
+	cmd.Env = append(os.Environ(), "GIT_DIR="+gitDir, "GIT_NO_LAZY_FETCH=1")
 	stdout, err := cmd.StdoutPipe()
 	if err != nil {
 		return err

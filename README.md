@@ -172,6 +172,42 @@ git -C /tmp/workers-sdk remote add origin https://github.com/cloudflare/workers-
   --fetch-ref main
 ```
 
+### Trusted verified prepared Git directories
+
+`--prepared-gitdir-verified` is an explicit trust-boundary opt-in for a caller
+that has already independently verified both the requested canonical ref and
+its exact commit in a prepared Git directory. It requires all of
+`--async`, `--prepared-gitdir`, `--git-dir`, an explicit canonical `--ref`,
+and a full 40- or 64-character `--prepared-commit`. ArtifactFS validates the
+prepared directory and its `origin`, resolves that ref locally, and refuses to
+prepare unless it equals the supplied commit. On a mismatch or a missing ref,
+regenerate the verified prepared Git directory; ArtifactFS will never fall back
+to an upstream fetch in this mode.
+
+For example, a workflow helper that has created a cache-assisted blobless
+prepared clone and verified `refs/heads/main` at `$CHECKOUT_OID` can register
+it as follows:
+
+```bash
+artifact-fs add-repo \
+  --name workers-sdk \
+  --ref refs/heads/main \
+  --async \
+  --prepared-gitdir \
+  --prepared-gitdir-verified \
+  --git-dir /cache/workers-sdk/.git \
+  --prepared-commit "$CHECKOUT_OID" \
+  --refresh never \
+  --mount-root /tmp
+```
+
+This skips only the **preparatory upstream** clone/fetch/ref verification in
+this ArtifactFS invocation. Tree indexing and blob-size resolution remain
+local-only. Later reads of file contents may still use the configured promisor
+remote through Git's on-demand `cat-file --batch` hydration, fetching only the
+requested blobs. Status records this as `acquisition=trusted_prepared`, not as
+an upstream verification performed by ArtifactFS.
+
 ## Verified shallow sources
 
 Use a verified source when a job must inspect the exact revision selected for a deployment:

@@ -18,27 +18,29 @@ func TestRepoPrepareFieldsRoundTrip(t *testing.T) {
 	defer store.Close()
 
 	cfg := model.RepoConfig{
-		ID:                    "repo",
-		Name:                  "repo",
-		MountRoot:             "/mnt",
-		MountPath:             "/mnt/repo",
-		RemoteURL:             "https://github.com/example/repo.git",
-		RemoteURLRedacted:     "https://github.com/example/repo.git",
-		Branch:                "master",
-		RefreshInterval:       time.Minute,
-		GitDir:                "/git/repo",
-		OverlayDir:            "/overlay/repo",
-		BlobCacheDir:          "/cache/repo",
-		MetaDBPath:            "/meta/repo.sqlite",
-		OverlayDBPath:         "/overlay/repo/meta.sqlite",
-		Enabled:               true,
-		PreparedGitDir:        true,
-		FetchRef:              "master",
-		PrepareState:          model.PrepareStatePreparing,
-		RequiredCommit:        "0123456789012345678901234567890123456789",
-		HistoryDepth:          1,
-		RemoteRefreshDisabled: true,
-		ConfigVersion:         "version-1",
+		ID:                     "repo",
+		Name:                   "repo",
+		MountRoot:              "/mnt",
+		MountPath:              "/mnt/repo",
+		RemoteURL:              "https://github.com/example/repo.git",
+		RemoteURLRedacted:      "https://github.com/example/repo.git",
+		Branch:                 "master",
+		RefreshInterval:        time.Minute,
+		GitDir:                 "/git/repo",
+		OverlayDir:             "/overlay/repo",
+		BlobCacheDir:           "/cache/repo",
+		MetaDBPath:             "/meta/repo.sqlite",
+		OverlayDBPath:          "/overlay/repo/meta.sqlite",
+		Enabled:                true,
+		PreparedGitDir:         true,
+		PreparedGitDirVerified: true,
+		PreparedCommit:         "abcdefabcdefabcdefabcdefabcdefabcdefabcd",
+		FetchRef:               "master",
+		PrepareState:           model.PrepareStatePreparing,
+		RequiredCommit:         "0123456789012345678901234567890123456789",
+		HistoryDepth:           1,
+		RemoteRefreshDisabled:  true,
+		ConfigVersion:          "version-1",
 	}
 	if err := store.AddRepo(ctx, cfg); err != nil {
 		t.Fatal(err)
@@ -51,8 +53,8 @@ func TestRepoPrepareFieldsRoundTrip(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !got.PreparedGitDir {
-		t.Fatal("PreparedGitDir = false, want true")
+	if !got.PreparedGitDir || !got.PreparedGitDirVerified || got.PreparedCommit != cfg.PreparedCommit {
+		t.Fatalf("prepared source policy = %+v", got)
 	}
 	if got.FetchRef != "master" {
 		t.Fatalf("FetchRef = %q, want master", got.FetchRef)

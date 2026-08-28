@@ -1104,6 +1104,116 @@ func TestRunPreparePreparedGitDirPublishesSnapshotAndMarksReady(t *testing.T) {
 	}
 }
 
+func TestRunPrepareTrustedPreparedGitDirSkipsUpstreamAndHydratesOnDemand(t *testing.T) {
+	ctx := context.Background()
+	tmp := t.TempDir()
+	bare := filepath.Join(tmp, "origin.git")
+	work := filepath.Join(tmp, "work")
+	prepared := filepath.Join(tmp, "prepared")
+	runCmd(t, "git", "init", "--bare", "--initial-branch", "main", bare)
+	runCmd(t, "git", "-C", bare, "config", "uploadpack.allowFilter", "true")
+	runCmd(t, "git", "clone", bare, work)
+	runCmd(t, "git", "-C", work, "checkout", "-b", "main")
+	if err := os.WriteFile(filepath.Join(work, "README.md"), []byte("lazy content\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	runCmd(t, "git", "-C", work, "add", "README.md")
+	runCmd(t, "git", "-C", work, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit", "-m", "init")
+	runCmd(t, "git", "-C", work, "push", "origin", "main")
+	oid := strings.TrimSpace(runCmdOutput(t, "git", "-C", work, "rev-parse", "HEAD"))
+	blobOID := strings.TrimSpace(runCmdOutput(t, "git", "-C", work, "rev-parse", "HEAD:README.md"))
+	runCmd(t, "git", "clone", "--depth=1", "--filter=blob:none", "--no-checkout", "file://"+bare, prepared)
+	preparedGitDir := filepath.Join(prepared, ".git")
+	noLazy := exec.Command("git", "--git-dir", preparedGitDir, "cat-file", "-e", blobOID+"^{blob}")
+	noLazy.Env = append(os.Environ(), "GIT_NO_LAZY_FETCH=1")
+	if err := noLazy.Run(); err == nil {
+		t.Fatal("prepared depth-1 blobless clone eagerly downloaded the blob")
+	}
+
+	// This is a command-runner assertion, not a lifecycle-log assertion: all
+	// Git invocations during ArtifactFS preparation pass through this wrapper.
+	realGit, err := exec.LookPath("git")
+	if err != nil {
+		t.Fatal(err)
+	}
+	bin := filepath.Join(tmp, "bin")
+	if err := os.MkdirAll(bin, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	commands := filepath.Join(tmp, "git-commands")
+	script := "#!/bin/sh\nprintf '%s\\n' \"$*\" >> \"$AFS_GIT_COMMANDS\"\nexec \"$AFS_REAL_GIT\" \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(bin, "git"), []byte(script), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("AFS_GIT_COMMANDS", commands)
+	t.Setenv("AFS_REAL_GIT", realGit)
+	t.Setenv("PATH", bin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	var logs bytes.Buffer
+	svc, err := New(ctx, filepath.Join(tmp, "artifact-fs"), slog.New(slog.NewJSONHandler(&logs, nil)))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer svc.Close()
+	cfg := model.RepoConfig{Name: "repo", ID: "repo", Branch: "refs/heads/main", GitDir: preparedGitDir, PreparedGitDir: true, PreparedGitDirVerified: true, PreparedCommit: oid, RemoteRefreshDisabled: true, Enabled: true}
+	if err := svc.AddRepoWithOptions(ctx, cfg, AddRepoOptions{Async: true}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := svc.registry.GetRepo(ctx, cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := svc.runPrepare(ctx, got); err != nil {
+		invocations, _ := os.ReadFile(commands)
+		t.Fatalf("runPrepare trusted prepared git dir: %v; commands:\n%s", err, invocations)
+	}
+
+	invocations, err := os.ReadFile(commands)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, forbidden := range []string{"fetch", "clone", "ls-remote"} {
+		if strings.Contains("\n"+string(invocations)+"\n", "\n"+forbidden+" ") || strings.HasSuffix(string(invocations), "\n"+forbidden+"\n") {
+			t.Fatalf("trusted prepared setup invoked upstream git %q: %s", forbidden, invocations)
+		}
+	}
+	noLazy = exec.Command(realGit, "--git-dir", preparedGitDir, "cat-file", "-e", blobOID+"^{blob}")
+	noLazy.Env = append(os.Environ(), "GIT_NO_LAZY_FETCH=1")
+	if err := noLazy.Run(); err == nil {
+		t.Fatalf("snapshot preparation hydrated blob before an on-demand read; commands:\n%s", invocations)
+	}
+	if got, err := svc.git.ReadBlob(ctx, cfg, blobOID, 1024); err != nil || string(got) != "lazy content\n" {
+		t.Fatalf("on-demand blob hydration = %q, %v", got, err)
+	}
+	if err := svc.FetchNow(ctx, cfg.Name); err == nil || !strings.Contains(err.Error(), "refresh is disabled") {
+		t.Fatalf("FetchNow error = %v, want refresh-disabled rejection", err)
+	}
+	st, err := svc.Status(ctx, cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Acquisition != "trusted_prepared" || st.RequiredCommit != oid {
+		t.Fatalf("trusted prepared status = %+v", st)
+	}
+	var sawTrustedLifecycle bool
+	decoder := json.NewDecoder(&logs)
+	for {
+		var event map[string]any
+		if err := decoder.Decode(&event); err != nil {
+			if errors.Is(err, io.EOF) {
+				break
+			}
+			t.Fatal(err)
+		}
+		if event["msg"] == logRepoPreparationCompleted && event["source"] == prepareSourceTrustedPreparedGitDir {
+			sawTrustedLifecycle = event["ref"] == "refs/heads/main" && event["expected_commit"] == oid && event["resolved_commit"] == oid && event["upstream_preparation_skipped"] == true
+		}
+	}
+	if !sawTrustedLifecycle {
+		t.Fatalf("missing structured trusted-prepared lifecycle event: %s", logs.String())
+	}
+}
+
 func TestSyncPrepareRetainsPreviousGenerationForDaemonHandoff(t *testing.T) {
 	ctx := context.Background()
 	tmp := t.TempDir()

@@ -30,31 +30,36 @@ type PreparedSource struct {
 }
 
 type RepoConfig struct {
-	ID                    RepoID
-	Name                  string
-	MountRoot             string
-	MountPath             string
-	RemoteURL             string
-	RemoteURLRedacted     string
-	Branch                string
-	RefreshInterval       time.Duration
-	GitDir                string
-	OverlayDir            string
-	BlobCacheDir          string
-	MetaDBPath            string
-	OverlayDBPath         string
-	Enabled               bool
-	PreparedGitDir        bool
-	FetchRef              string
-	PrepareState          string
-	PrepareError          string
-	RequiredCommit        string
-	HistoryDepth          int
-	RemoteRefreshDisabled bool
-	AcquiredRef           string
-	AcquiredCommit        string
-	AcquiredAt            time.Time
-	ConfigVersion         string
+	ID                RepoID
+	Name              string
+	MountRoot         string
+	MountPath         string
+	RemoteURL         string
+	RemoteURLRedacted string
+	Branch            string
+	RefreshInterval   time.Duration
+	GitDir            string
+	OverlayDir        string
+	BlobCacheDir      string
+	MetaDBPath        string
+	OverlayDBPath     string
+	Enabled           bool
+	PreparedGitDir    bool
+	// PreparedGitDirVerified opts into trusting an independently verified
+	// prepared Git directory. PreparedCommit is the exact commit that its
+	// configured source ref must resolve to locally.
+	PreparedGitDirVerified bool
+	PreparedCommit         string
+	FetchRef               string
+	PrepareState           string
+	PrepareError           string
+	RequiredCommit         string
+	HistoryDepth           int
+	RemoteRefreshDisabled  bool
+	AcquiredRef            string
+	AcquiredCommit         string
+	AcquiredAt             time.Time
+	ConfigVersion          string
 }
 
 type RepoRuntimeState struct {
@@ -201,6 +206,7 @@ type GitStore interface {
 	CommitTimestamp(ctx context.Context, repo RepoConfig, oid string) (int64, error)
 	ReadTreeHEAD(ctx context.Context, repo RepoConfig) error
 	PrepareFetchedBranch(ctx context.Context, repo RepoConfig, ref string) error
+	PrepareTrustedPreparedGitDir(ctx context.Context, repo RepoConfig, ref string, expectedCommit string) (resolvedCommit string, err error)
 	ValidatePreparedGitDir(ctx context.Context, repo RepoConfig) error
 }
 
