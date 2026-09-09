@@ -66,3 +66,22 @@ func TestGatedFileSystemFailedGateReturnsEIO(t *testing.T) {
 		t.Fatalf("lookups after failed gate = %d, want 0", got)
 	}
 }
+
+func TestDeferredGatedFileSystemServesEmptyRootWhileAwaiting(t *testing.T) {
+	gate := NewReadyGate(false)
+	fs := NewDeferredGatedFileSystem(&recordingFS{}, gate)
+	open := &fuseops.OpenDirOp{Inode: fuseops.RootInodeID}
+	if err := fs.OpenDir(context.Background(), open); err != nil {
+		t.Fatalf("OpenDir root = %v", err)
+	}
+	read := &fuseops.ReadDirOp{Handle: open.Handle, Dst: make([]byte, 128)}
+	if err := fs.ReadDir(context.Background(), read); err != nil {
+		t.Fatalf("ReadDir root = %v", err)
+	}
+	if read.BytesRead != 0 {
+		t.Fatalf("empty deferred root bytes = %d, want 0", read.BytesRead)
+	}
+	if err := fs.ReleaseDirHandle(context.Background(), &fuseops.ReleaseDirHandleOp{Handle: open.Handle}); err != nil {
+		t.Fatalf("ReleaseDirHandle root = %v", err)
+	}
+}

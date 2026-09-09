@@ -4,6 +4,7 @@ package fusefs
 
 import (
 	"context"
+	"sync"
 	"syscall"
 
 	"github.com/jacobsa/fuse/fuseops"
@@ -11,15 +12,30 @@ import (
 )
 
 type gatedFileSystem struct {
-	next fuseutil.FileSystem
-	gate *ReadyGate
+	next              fuseutil.FileSystem
+	gate              *ReadyGate
+	emptyAwaitingRoot bool
+	mu                sync.Mutex
+	emptyRootHandles  map[fuseops.HandleID]bool
+	nextEmptyHandle   fuseops.HandleID
 }
 
 func NewGatedFileSystem(next fuseutil.FileSystem, gate *ReadyGate) fuseutil.FileSystem {
+	return newGatedFileSystem(next, gate, false)
+}
+
+// NewDeferredGatedFileSystem permits only empty root-directory probes until a
+// deferred repository is configured. This is enough for mount consumers to
+// attach the FUSE connection without advertising a fabricated repository tree.
+func NewDeferredGatedFileSystem(next fuseutil.FileSystem, gate *ReadyGate) fuseutil.FileSystem {
+	return newGatedFileSystem(next, gate, true)
+}
+
+func newGatedFileSystem(next fuseutil.FileSystem, gate *ReadyGate, emptyAwaitingRoot bool) fuseutil.FileSystem {
 	if gate == nil {
 		return next
 	}
-	return &gatedFileSystem{next: next, gate: gate}
+	return &gatedFileSystem{next: next, gate: gate, emptyAwaitingRoot: emptyAwaitingRoot, emptyRootHandles: map[fuseops.HandleID]bool{}, nextEmptyHandle: 1 << 63}
 }
 
 func (fs *gatedFileSystem) wait(ctx context.Context) error {
@@ -121,6 +137,15 @@ func (fs *gatedFileSystem) Unlink(ctx context.Context, op *fuseops.UnlinkOp) err
 }
 
 func (fs *gatedFileSystem) OpenDir(ctx context.Context, op *fuseops.OpenDirOp) error {
+	if fs.emptyAwaitingRoot && op.Inode == fuseops.RootInodeID && fs.gate.Pending() {
+		fs.mu.Lock()
+		handle := fs.nextEmptyHandle
+		fs.nextEmptyHandle++
+		fs.emptyRootHandles[handle] = true
+		fs.mu.Unlock()
+		op.Handle = handle
+		return nil
+	}
 	if err := fs.wait(ctx); err != nil {
 		return err
 	}
@@ -128,6 +153,9 @@ func (fs *gatedFileSystem) OpenDir(ctx context.Context, op *fuseops.OpenDirOp) e
 }
 
 func (fs *gatedFileSystem) ReadDir(ctx context.Context, op *fuseops.ReadDirOp) error {
+	if fs.emptyRootHandle(op.Handle) {
+		return nil
+	}
 	if err := fs.wait(ctx); err != nil {
 		return err
 	}
@@ -135,6 +163,9 @@ func (fs *gatedFileSystem) ReadDir(ctx context.Context, op *fuseops.ReadDirOp) e
 }
 
 func (fs *gatedFileSystem) ReadDirPlus(ctx context.Context, op *fuseops.ReadDirPlusOp) error {
+	if fs.emptyRootHandle(op.Handle) {
+		return nil
+	}
 	if err := fs.wait(ctx); err != nil {
 		return err
 	}
@@ -142,7 +173,26 @@ func (fs *gatedFileSystem) ReadDirPlus(ctx context.Context, op *fuseops.ReadDirP
 }
 
 func (fs *gatedFileSystem) ReleaseDirHandle(ctx context.Context, op *fuseops.ReleaseDirHandleOp) error {
+	if fs.removeEmptyRootHandle(op.Handle) {
+		return nil
+	}
 	return fs.next.ReleaseDirHandle(ctx, op)
+}
+
+func (fs *gatedFileSystem) emptyRootHandle(handle fuseops.HandleID) bool {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	return fs.emptyRootHandles[handle]
+}
+
+func (fs *gatedFileSystem) removeEmptyRootHandle(handle fuseops.HandleID) bool {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	if !fs.emptyRootHandles[handle] {
+		return false
+	}
+	delete(fs.emptyRootHandles, handle)
+	return true
 }
 
 func (fs *gatedFileSystem) OpenFile(ctx context.Context, op *fuseops.OpenFileOp) error {

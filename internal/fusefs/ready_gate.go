@@ -59,6 +59,18 @@ func (g *ReadyGate) Wait(ctx context.Context) error {
 	return ErrRepoNotReady
 }
 
+// Pending reports whether the gate is still awaiting a repository. It is used
+// only by the deferred mount's root-directory probe path; all repository
+// operations continue to wait for readiness.
+func (g *ReadyGate) Pending() bool {
+	if g == nil {
+		return false
+	}
+	g.mu.Lock()
+	defer g.mu.Unlock()
+	return !g.ready && g.err == nil
+}
+
 func (g *ReadyGate) Reset() {
 	if g == nil {
 		return

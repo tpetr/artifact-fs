@@ -47,6 +47,11 @@ var migrations = []string{
 	  created_at_ns INTEGER NOT NULL,
 	  updated_at_ns INTEGER NOT NULL
 	);`,
+	`CREATE TABLE IF NOT EXISTS awaiting_mounts (
+	  name TEXT PRIMARY KEY,
+	  mount_path TEXT NOT NULL,
+	  created_at_ns INTEGER NOT NULL
+	);`,
 }
 
 type Store struct {
@@ -232,6 +237,63 @@ func (s *Store) RecordAcquisition(ctx context.Context, cfg model.RepoConfig, sou
 
 func (s *Store) RemoveRepo(ctx context.Context, name string) error {
 	_, err := s.db.ExecContext(ctx, `DELETE FROM repos WHERE name=?`, name)
+	return err
+}
+
+// ReserveAwaitingMount records a daemon-owned mount that was established before
+// its repository configuration exists. It lets another process validate that a
+// later add-repo command targets the already-published FUSE connection.
+func (s *Store) ReserveAwaitingMount(ctx context.Context, name, mountPath string) error {
+	var existingName, existingPath string
+	err := s.db.QueryRowContext(ctx, `SELECT name, mount_path FROM awaiting_mounts LIMIT 1`).Scan(&existingName, &existingPath)
+	if err == nil && existingName != name {
+		return fmt.Errorf("repo %q is already awaiting on mount %s", existingName, existingPath)
+	}
+	if err != nil && !errors.Is(err, sql.ErrNoRows) {
+		return err
+	}
+	existing, ok, err := s.AwaitingMountPath(ctx, name)
+	if err != nil {
+		return err
+	}
+	if ok {
+		if existing != mountPath {
+			return fmt.Errorf("repo %q is already awaiting on mount %s", name, existing)
+		}
+		return nil
+	}
+	_, err = s.db.ExecContext(ctx, `
+		INSERT INTO awaiting_mounts (name, mount_path, created_at_ns)
+		VALUES (?, ?, ?)
+		ON CONFLICT(name) DO NOTHING
+	`, name, mountPath, time.Now().UnixNano())
+	if err != nil {
+		return err
+	}
+	existing, ok, err = s.AwaitingMountPath(ctx, name)
+	if err != nil {
+		return err
+	}
+	if !ok || existing != mountPath {
+		return fmt.Errorf("repo %q is already awaiting on mount %s", name, existing)
+	}
+	return nil
+}
+
+func (s *Store) AwaitingMountPath(ctx context.Context, name string) (string, bool, error) {
+	var mountPath string
+	err := s.db.QueryRowContext(ctx, `SELECT mount_path FROM awaiting_mounts WHERE name=?`, name).Scan(&mountPath)
+	if errors.Is(err, sql.ErrNoRows) {
+		return "", false, nil
+	}
+	if err != nil {
+		return "", false, err
+	}
+	return mountPath, true, nil
+}
+
+func (s *Store) RemoveAwaitingMount(ctx context.Context, name string) error {
+	_, err := s.db.ExecContext(ctx, `DELETE FROM awaiting_mounts WHERE name=?`, name)
 	return err
 }
 
