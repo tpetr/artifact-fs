@@ -237,6 +237,71 @@ The remote must advertise Git partial-clone filtering for file contents to hydra
 
 See the [generic container example](examples/README.md) for Docker-compatible runtimes or the [Cloudflare Sandbox SDK example](examples/cloudflare-sandbox-sdk/README.md) for Workers and Containers.
 
+### Kubernetes restartable-init FUSE sidecar
+
+When a CSI driver needs the FUSE descriptor before it can start the workflow
+container, run ArtifactFS as a restartable init sidecar with `--await-repo`.
+The sidecar mounts a private, shared `emptyDir` path; the CSI driver publishes
+that already-mounted path through its normal `FUSERMOUNT3PROXY_FDPASSING_SOCKPATH`
+handoff. ArtifactFS does not mount the CSI-published target and does not change
+the fd-passing protocol.
+
+The sidecar and the workflow container must share both `ARTIFACT_FS_ROOT` and
+the private mount-root. For one externally published mount, use one repository
+name:
+
+```sh
+# Restartable init sidecar. It has /dev/fuse and the driver's existing
+# FUSERMOUNT3PROXY_FDPASSING_SOCKPATH, but no Git credentials are needed here.
+export ARTIFACT_FS_ROOT=/wf-artifact-fs/state
+artifact-fs daemon \
+  --root /wf-artifact-fs/private-mnt \
+  --await-repo workflow-repo
+```
+
+`daemon` immediately creates `/wf-artifact-fs/private-mnt/workflow-repo` and
+keeps its original FUSE connection open. Before registration, the mount answers
+root metadata and an empty root-directory probe so container runtimes can attach
+it, but it does not expose repository entries. All repository operations remain
+behind the readiness gate.
+
+After the main workflow container starts, let the credentialed GitTool process
+perform the normal registration and synchronous preparation against the shared
+state root:
+
+```sh
+export ARTIFACT_FS_ROOT=/wf-artifact-fs/state
+artifact-fs add-repo \
+  --name workflow-repo \
+  --remote "$REPOSITORY_URL" \
+  --ref "$REPOSITORY_REF" \
+  --require-commit "$WORKFLOW_COMMIT" \
+  --mount-root /wf-artifact-fs/private-mnt
+```
+
+Use the same `--mount-root` in both containers; conflicting registration is
+rejected rather than moving the published mount. During synchronous preparation
+the deferred mount remains gated, then the sidecar activates the prepared
+snapshot on the original connection. A failed preparation remains explicitly
+gated and can be retried with another `add-repo` invocation. The existing async
+form also works, including a trusted prepared Git directory:
+
+```sh
+artifact-fs add-repo \
+  --name workflow-repo \
+  --ref refs/heads/main \
+  --async \
+  --prepared-gitdir \
+  --prepared-gitdir-verified \
+  --git-dir /wf-prepared/repo.git \
+  --prepared-commit "$WORKFLOW_COMMIT" \
+  --refresh never \
+  --mount-root /wf-artifact-fs/private-mnt
+```
+
+In that trusted mode the daemon validates and indexes the prepared Git directory
+locally; it does not need remote credentials in the sidecar.
+
 ## Architecture
 
 ArtifactFS has two distinct phases: a one-shot **setup** (`add-repo`) that registers and usually prepares a fast blobless clone, and a long-running **daemon** that mounts it via FUSE and serves file operations. With `add-repo --async`, setup only registers the repo; the daemon performs clone/fetch and snapshot publishing while FUSE operations wait behind a readiness gate.

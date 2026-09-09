@@ -117,6 +117,18 @@ func NewArtifactFuse(repo model.RepoConfig, resolver *Resolver, engine *Engine) 
 	return fs
 }
 
+// Reconfigure replaces an awaiting filesystem's backend without replacing its
+// FUSE connection. Callers must keep the filesystem behind a ReadyGate while
+// this runs, so no non-root inode or handle can outlive the old backend.
+func (fs *ArtifactFuse) Reconfigure(repo model.RepoConfig, resolver *Resolver, engine *Engine) {
+	fs.handleOps.Lock()
+	defer fs.handleOps.Unlock()
+	fs.repo = repo
+	fs.resolver = resolver
+	fs.engine = engine
+	fs.gitfileContent = fmt.Appendf(nil, "gitdir: %s\n", repo.GitDir)
+}
+
 func (fs *ArtifactFuse) allocInode(path, typ string, mode uint32, gen int64) *InodeRef {
 	// Caller must hold fs.mu write lock.
 	if id, ok := fs.pathToInode[path]; ok {
@@ -1140,8 +1152,31 @@ func MountRepo(repo model.RepoConfig, resolver *Resolver, engine *Engine) (Mount
 }
 
 func MountRepoWithGate(repo model.RepoConfig, resolver *Resolver, engine *Engine, gate *ReadyGate) (MountedFS, error) {
+	mfs, _, err := MountRepoWithGateAndFileSystem(repo, resolver, engine, gate)
+	return mfs, err
+}
+
+// MountRepoWithGateAndFileSystem returns the adapter as well as the mounted
+// connection. Deferred daemon mode uses the adapter to attach a prepared
+// repository later without remounting.
+func MountRepoWithGateAndFileSystem(repo model.RepoConfig, resolver *Resolver, engine *Engine, gate *ReadyGate) (MountedFS, *ArtifactFuse, error) {
+	return mountRepoWithFileSystem(repo, resolver, engine, gate, false)
+}
+
+// MountDeferredRepo mounts an awaiting repository with an empty, probe-safe
+// root until its configuration arrives. It uses the same FUSE/fusermount
+// connection as the later activated repository.
+func MountDeferredRepo(repo model.RepoConfig, resolver *Resolver, engine *Engine, gate *ReadyGate) (MountedFS, *ArtifactFuse, error) {
+	return mountRepoWithFileSystem(repo, resolver, engine, gate, true)
+}
+
+func mountRepoWithFileSystem(repo model.RepoConfig, resolver *Resolver, engine *Engine, gate *ReadyGate, deferred bool) (MountedFS, *ArtifactFuse, error) {
 	fsint := NewArtifactFuse(repo, resolver, engine)
-	server := fuseutil.NewFileSystemServer(NewGatedFileSystem(fsint, gate))
+	fsServer := NewGatedFileSystem(fsint, gate)
+	if deferred {
+		fsServer = NewDeferredGatedFileSystem(fsint, gate)
+	}
+	server := fuseutil.NewFileSystemServer(fsServer)
 
 	mountCfg := &fuse.MountConfig{
 		FSName:                  "artifact-fs:" + repo.Name,
@@ -1154,10 +1189,10 @@ func MountRepoWithGate(repo model.RepoConfig, resolver *Resolver, engine *Engine
 
 	mfs, err := fuse.Mount(repo.MountPath, server, mountCfg)
 	if err != nil {
-		return nil, fmt.Errorf("fuse mount %s: %w", repo.MountPath, err)
+		return nil, nil, fmt.Errorf("fuse mount %s: %w", repo.MountPath, err)
 	}
 
-	return &mountedFSWrapper{MountedFileSystem: mfs, mountPoint: repo.MountPath}, nil
+	return &mountedFSWrapper{MountedFileSystem: mfs, mountPoint: repo.MountPath}, fsint, nil
 }
 
 func TryUnmount(mountPoint string) error {

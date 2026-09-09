@@ -127,6 +127,70 @@ func TestE2EAsyncPreparedGitDirFailureThenRetry(t *testing.T) {
 	assertGitStatus(t, repo.mountPath, map[string]string{})
 }
 
+func TestE2EDeferredMountActivatesAfterSyncRegistration(t *testing.T) {
+	if os.Getenv("AFS_RUN_E2E_TESTS") != "1" {
+		t.Skip("skipping e2e tests (set AFS_RUN_E2E_TESTS=1 to run)")
+	}
+	skipIfNoFUSE(t)
+
+	remoteURL := os.Getenv("AFS_E2E_REPO")
+	if remoteURL == "" {
+		remoteURL = createLocalTestRepo(t)
+	}
+	root := t.TempDir()
+	mountRoot := t.TempDir()
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	sidecar, err := daemon.New(ctx, root, logging.NewJSONLogger(os.Stderr, slog.LevelWarn))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer sidecar.Close()
+	sidecar.SetMountRoot(mountRoot)
+	if err := sidecar.AwaitRepo(ctx, repoName); err != nil {
+		t.Fatal(err)
+	}
+	mountPath := filepath.Join(mountRoot, repoName)
+	entries, err := os.ReadDir(mountPath)
+	if err != nil {
+		t.Fatalf("read deferred root: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("deferred root entries = %v, want no fabricated repository entries", entries)
+	}
+	startDone := make(chan error, 1)
+	go func() { startDone <- sidecar.Start(ctx) }()
+
+	// This service models the credentialed main workflow process. It shares the
+	// ArtifactFS state root but does not own or mount the FUSE connection.
+	registrar, err := daemon.New(context.Background(), root, logging.NewJSONLogger(os.Stderr, slog.LevelWarn))
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer registrar.Close()
+	if err := registrar.AddRepo(context.Background(), model.RepoConfig{
+		Name: repoName, ID: model.RepoID(repoName), RemoteURL: remoteURL, Branch: "main", MountRoot: mountRoot, Enabled: true,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	waitForCondition(t, 15*time.Second, "deferred mount activated", func() (bool, string) {
+		data, err := os.ReadFile(filepath.Join(mountPath, "README.md"))
+		if err != nil {
+			return false, err.Error()
+		}
+		return len(data) > 0, "README is empty"
+	})
+	cancel()
+	select {
+	case err := <-startDone:
+		if err != nil && err != context.Canceled {
+			t.Fatalf("deferred daemon stopped: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("deferred daemon did not stop")
+	}
+}
+
 func createPreparedGitDir(t *testing.T, remoteURL string) (gitDir string, worktree string) {
 	t.Helper()
 	tmp := t.TempDir()

@@ -101,6 +101,7 @@ type Service struct {
 	mountFailures        map[model.RepoID]*mountFailure
 	prepareWorkers       sync.WaitGroup
 	closing              bool
+	mountWithGate        func(model.RepoConfig, *fusefs.Resolver, *fusefs.Engine, *fusefs.ReadyGate) (fusefs.MountedFS, *fusefs.ArtifactFuse, error)
 }
 
 type mountFailure struct {
@@ -119,6 +120,7 @@ type repoRuntime struct {
 	resolver *fusefs.Resolver
 	engine   *fusefs.Engine
 	mfs      fusefs.MountedFS
+	fuse     *fusefs.ArtifactFuse
 	gate     *fusefs.ReadyGate
 	state    model.RepoRuntimeState
 	active   bool
@@ -126,10 +128,17 @@ type repoRuntime struct {
 	joinDone chan struct{}
 	stopping bool
 	detached bool
+	// deferred identifies the one pre-mounted runtime which can be rebound in
+	// place once add-repo publishes its configuration. awaiting is only true
+	// until that first registry entry appears.
+	deferred bool
+	awaiting bool
 	headMu   sync.Mutex
 	workers  sync.WaitGroup
 	mounts   sync.WaitGroup
 }
+
+const prepareStateAwaiting = "awaiting-repository"
 
 type aheadBehind struct {
 	ahead    int
@@ -235,6 +244,42 @@ func (s *Service) SetMountRoot(root string) {
 	}
 }
 
+// AwaitRepo establishes exactly one gated FUSE mount before the repository has
+// been registered. The later add-repo invocation must use the same mount root.
+func (s *Service) AwaitRepo(ctx context.Context, name string) error {
+	if err := model.ValidateRepoName(name); err != nil {
+		return err
+	}
+	if strings.TrimSpace(s.mountRoot) == "" {
+		return errors.New("--await-repo requires daemon --root")
+	}
+	s.mu.Lock()
+	hasRuntime := len(s.running) != 0
+	s.mu.Unlock()
+	if hasRuntime {
+		return errors.New("--await-repo supports exactly one repository per externally published mount")
+	}
+	return s.withRepoLock(ctx, "awaiting-mount.lock", func() error {
+		repos, err := s.registry.ListRepos(ctx)
+		if err != nil {
+			return err
+		}
+		if len(repos) != 0 {
+			return errors.New("--await-repo requires an empty registry; one externally published mount can await only one repository")
+		}
+		cfg := model.RepoConfig{Name: name, ID: model.RepoID(name), Enabled: true, PrepareState: prepareStateAwaiting}
+		s.fillPaths(&cfg)
+		if err := s.registry.ReserveAwaitingMount(ctx, name, cfg.MountPath); err != nil {
+			return err
+		}
+		if err := s.mountAwaitingRepo(ctx, cfg); err != nil {
+			_ = s.registry.RemoveAwaitingMount(ctx, name)
+			return err
+		}
+		return nil
+	})
+}
+
 func (s *Service) SetHydrationConcurrency(n int) {
 	if n > 0 {
 		s.hydrationConcurrency = n
@@ -318,6 +363,12 @@ func (s *Service) syncRepos(ctx context.Context) error {
 		}
 		s.mu.Unlock()
 		if running && runningConfigVersion != repo.ConfigVersion {
+			if rt.deferred {
+				if err := s.syncDeferredRepo(ctx, rt, repo); err != nil {
+					s.logger.Error("deferred repo sync failed", "repo", repo.Name, "error", err)
+				}
+				continue
+			}
 			s.logger.InfoContext(ctx, logRepoConfigChanged, "repo", auth.RedactLogString(repo.Name))
 			if err := s.unmount(repo.ID); err != nil {
 				s.logger.Error("repo prepare remount unmount failed", "repo", repo.Name, "error", err)
@@ -329,6 +380,12 @@ func (s *Service) syncRepos(ctx context.Context) error {
 			alreadyPreparing = false
 		}
 		if running {
+			if rt.deferred {
+				if err := s.syncDeferredRepo(ctx, rt, repo); err != nil {
+					s.logger.Error("deferred repo sync failed", "repo", repo.Name, "error", err)
+				}
+				continue
+			}
 			s.retryRuntimeMount(rt)
 			s.updateRuntimeRefresh(rt, repo.RefreshInterval, repo.RemoteRefreshDisabled)
 			s.restartRunningPrepareIfCurrent(ctx, repo, rt, alreadyPreparing)
@@ -373,7 +430,8 @@ func (s *Service) syncRepos(ctx context.Context) error {
 	s.mu.Lock()
 	var stale []model.RepoID
 	for id := range s.running {
-		if !registered[id] {
+		rt := s.running[id]
+		if !registered[id] && (rt == nil || !rt.awaiting) {
 			stale = append(stale, id)
 		}
 	}
@@ -526,6 +584,13 @@ func (s *Service) AddRepoWithOptions(ctx context.Context, cfg model.RepoConfig, 
 	}
 	explicitGitDir := strings.TrimSpace(cfg.GitDir) != ""
 	s.fillPaths(&cfg)
+	awaitingPath, awaiting, err := s.registry.AwaitingMountPath(ctx, cfg.Name)
+	if err != nil {
+		return err
+	}
+	if awaiting && cfg.MountPath != awaitingPath {
+		return fmt.Errorf("repo %q is awaiting on published mount %s; use --mount-root %s", cfg.Name, awaitingPath, filepath.Dir(awaitingPath))
+	}
 	if strings.TrimSpace(cfg.FetchRef) == "" {
 		cfg.FetchRef = defaultFetchRef(cfg.Branch)
 	}
@@ -577,8 +642,10 @@ func (s *Service) AddRepoWithOptions(ctx context.Context, cfg model.RepoConfig, 
 		}
 	}
 	registeredCfg := cfg
-	if err := s.withRepoConfigLock(ctx, cfg.Name, func() error {
-		return s.registry.AddRepo(ctx, cfg)
+	if err := s.withRepoLock(ctx, "awaiting-mount.lock", func() error {
+		return s.withRepoConfigLock(ctx, cfg.Name, func() error {
+			return s.registry.AddRepo(ctx, cfg)
+		})
 	}); err != nil {
 		return err
 	}
@@ -589,7 +656,7 @@ func (s *Service) AddRepoWithOptions(ctx context.Context, cfg model.RepoConfig, 
 	// the FUSE server -- that's the daemon's job.
 	cfg.RemoteURL = cloneURL
 	prepareCtx, cancel := context.WithTimeout(ctx, s.prepareTimeoutDuration())
-	err := s.prepareRepo(prepareCtx, cfg)
+	err = s.prepareRepo(prepareCtx, cfg)
 	prepareContextErr := prepareCtx.Err()
 	cancel()
 	if err == nil {
@@ -1095,6 +1162,10 @@ func (s *Service) mountRepo(ctx context.Context, cfg model.RepoConfig) error {
 }
 
 func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) error {
+	return s.mountAsyncRepoMode(ctx, cfg, false)
+}
+
+func (s *Service) mountAsyncRepoMode(ctx context.Context, cfg model.RepoConfig, deferred bool) error {
 	s.fillPaths(&cfg)
 	if err := os.MkdirAll(cfg.MountPath, 0o755); err != nil {
 		return err
@@ -1134,7 +1205,7 @@ func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) erro
 		Hydrator: h,
 	}
 
-	mfs, err := fusefs.MountRepoWithGate(cfg, resolver, engine, gate)
+	mfs, fsint, err := s.mountGatedMode(cfg, resolver, engine, gate, deferred)
 	if err != nil {
 		s.logger.Error("fuse mount failed, runtime will retry", "repo", cfg.Name, "error", err)
 		mfs = nil
@@ -1154,6 +1225,7 @@ func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) erro
 		resolver: resolver,
 		engine:   engine,
 		mfs:      mfs,
+		fuse:     fsint,
 		gate:     gate,
 		refresh:  make(chan time.Duration, 1),
 		state: model.RepoRuntimeState{
@@ -1167,6 +1239,162 @@ func (s *Service) mountAsyncRepo(ctx context.Context, cfg model.RepoConfig) erro
 		},
 	}
 	s.startRuntime(rt)
+	return nil
+}
+
+func (s *Service) mountGated(cfg model.RepoConfig, resolver *fusefs.Resolver, engine *fusefs.Engine, gate *fusefs.ReadyGate) (fusefs.MountedFS, *fusefs.ArtifactFuse, error) {
+	return s.mountGatedMode(cfg, resolver, engine, gate, false)
+}
+
+func (s *Service) mountGatedMode(cfg model.RepoConfig, resolver *fusefs.Resolver, engine *fusefs.Engine, gate *fusefs.ReadyGate, deferred bool) (fusefs.MountedFS, *fusefs.ArtifactFuse, error) {
+	if s.mountWithGate != nil {
+		return s.mountWithGate(cfg, resolver, engine, gate)
+	}
+	if deferred {
+		return fusefs.MountDeferredRepo(cfg, resolver, engine, gate)
+	}
+	return fusefs.MountRepoWithGateAndFileSystem(cfg, resolver, engine, gate)
+}
+
+func (s *Service) mountAwaitingRepo(ctx context.Context, cfg model.RepoConfig) error {
+	if err := s.mountAsyncRepoMode(ctx, cfg, true); err != nil {
+		return fmt.Errorf("mount awaiting repository %q: %w", cfg.Name, err)
+	}
+	s.mu.Lock()
+	rt := s.running[cfg.ID]
+	if rt != nil {
+		rt.deferred = true
+		rt.awaiting = true
+		rt.state.State = prepareStateAwaiting
+	}
+	s.mu.Unlock()
+	return nil
+}
+
+// syncDeferredRepo promotes the pre-mounted runtime in place. In particular it
+// never calls Unmount or fuse.Mount after the initial descriptor handoff.
+func (s *Service) syncDeferredRepo(ctx context.Context, rt *repoRuntime, cfg model.RepoConfig) error {
+	s.fillPaths(&cfg)
+	s.mu.Lock()
+	if s.running[cfg.ID] != rt || rt.stopping || !rt.deferred {
+		s.mu.Unlock()
+		return registry.ErrRepoChanged
+	}
+	if cfg.MountPath != rt.cfg.MountPath {
+		rt.state.State = model.PrepareStateFailed
+		rt.state.PrepareError = fmt.Sprintf("awaiting mount is %s; add-repo must use that mount root", rt.cfg.MountPath)
+		gate := rt.gate
+		s.mu.Unlock()
+		gate.MarkFailed(errors.New("deferred repository mount path conflicts with the published mount"))
+		return fmt.Errorf("repo %q requests mount path %s, but the published deferred mount is %s", cfg.Name, cfg.MountPath, rt.cfg.MountPath)
+	}
+	s.mu.Unlock()
+
+	if err := s.bindDeferredRuntime(ctx, rt, cfg); err != nil {
+		return err
+	}
+	s.mu.Lock()
+	rt.awaiting = false
+	s.mu.Unlock()
+
+	switch cfg.PrepareState {
+	case model.PrepareStateSyncPreparing:
+		return nil
+	case model.PrepareStatePreparing:
+		s.startPrepareWorker(ctx, cfg)
+		return nil
+	case model.PrepareStateFailed:
+		return nil
+	case model.PrepareStateReady, "":
+		oid, ref, gen, err := rt.snapshot.ReadState(ctx)
+		if err != nil || gen == 0 || oid == "" {
+			err = fmt.Errorf("prepared repository has no published snapshot")
+			s.mu.Lock()
+			if s.running[cfg.ID] == rt {
+				rt.state.State = model.PrepareStateFailed
+				rt.state.PrepareError = err.Error()
+			}
+			s.mu.Unlock()
+			rt.gate.MarkFailed(err)
+			return err
+		}
+		if err := s.completePreparedRuntime(ctx, cfg, oid, ref, gen); err != nil {
+			return err
+		}
+		return nil
+	default:
+		return fmt.Errorf("repo %q has unknown preparation state %q", cfg.Name, cfg.PrepareState)
+	}
+}
+
+func (s *Service) bindDeferredRuntime(ctx context.Context, rt *repoRuntime, cfg model.RepoConfig) error {
+	s.mu.Lock()
+	if s.running[cfg.ID] != rt || rt.stopping {
+		s.mu.Unlock()
+		return registry.ErrRepoChanged
+	}
+	if samePrepareConfig(rt.cfg, cfg) {
+		s.mu.Unlock()
+		return nil
+	}
+	s.mu.Unlock()
+
+	snap, err := snapshot.New(ctx, cfg.MetaDBPath)
+	if err != nil {
+		return err
+	}
+	ov, err := overlay.New(ctx, cfg)
+	if err != nil {
+		snap.Close()
+		return err
+	}
+	h := hydrator.New(s.git)
+	resolver := &fusefs.Resolver{Snapshot: snap, Overlay: ov}
+	oid, _, gen, _ := snap.ReadState(ctx)
+	resolver.SetGeneration(gen)
+	if oid != "" {
+		s.refreshCommitTime(ctx, cfg, oid, resolver, "commit timestamp unavailable, mtime will use generation fallback")
+	}
+	sizes := newSizeUpdateBatcher(snap, s.logger, cfg.Name)
+	sizes.Start(rt.ctx)
+	h.SetOnHydrated(func(_ model.RepoID, objectOID string, size int64) { sizes.Add(resolver.Generation(), objectOID, size) })
+	h.Start(s.hydrationWorkers(), cfg)
+	engine := &fusefs.Engine{Resolver: resolver, Repo: cfg, Overlay: ov, Hydrator: h}
+
+	s.mu.Lock()
+	if s.running[cfg.ID] != rt || rt.stopping {
+		s.mu.Unlock()
+		h.Stop()
+		sizes.Stop()
+		ov.Close()
+		snap.Close()
+		return registry.ErrRepoChanged
+	}
+	oldSnapshot, oldOverlay, oldHydrator, oldSizes := rt.snapshot, rt.overlay, rt.hydrator, rt.sizes
+	if rt.fuse != nil {
+		rt.fuse.Reconfigure(cfg, resolver, engine)
+	}
+	rt.cfg, rt.snapshot, rt.overlay, rt.hydrator, rt.sizes, rt.resolver, rt.engine = cfg, snap, ov, h, sizes, resolver, engine
+	rt.state.State = cfg.PrepareState
+	rt.state.PrepareError = cfg.PrepareError
+	if cfg.PrepareState == model.PrepareStateFailed {
+		rt.gate.MarkFailed(prepareGateError(cfg.PrepareError))
+	} else {
+		rt.gate.Reset()
+	}
+	s.mu.Unlock()
+	if oldHydrator != nil {
+		oldHydrator.Stop()
+	}
+	if oldSizes != nil {
+		oldSizes.Stop()
+	}
+	if oldOverlay != nil {
+		_ = oldOverlay.Close()
+	}
+	if oldSnapshot != nil {
+		_ = oldSnapshot.Close()
+	}
 	return nil
 }
 
@@ -1581,11 +1809,19 @@ func (s *Service) completePreparedRuntime(ctx context.Context, cfg model.RepoCon
 	rt.cfg = cfg
 	rt.cfg.PrepareState = model.PrepareStateReady
 	rt.cfg.PrepareError = ""
+	wasDeferred := rt.deferred
+	rt.deferred = false
+	rt.awaiting = false
 	setHeadState(&rt.state, headOID, headRef, gen)
 	rt.state.State = repoStateMounted
 	rt.state.PrepareError = ""
 	s.mu.Unlock()
 	rt.gate.MarkReady()
+	if wasDeferred {
+		if err := s.registry.RemoveAwaitingMount(ctx, cfg.Name); err != nil {
+			s.logger.Warn("remove deferred mount reservation failed", "repo", cfg.Name, "error", err)
+		}
+	}
 	s.startRepoBackground(rt)
 	return nil
 }
@@ -2100,7 +2336,7 @@ func (s *Service) retryRuntimeMount(rt *repoRuntime) {
 	s.mu.Unlock()
 	defer rt.mounts.Done()
 
-	mfs, err := fusefs.MountRepoWithGate(cfg, resolver, engine, gate)
+	mfs, fsint, err := s.mountGated(cfg, resolver, engine, gate)
 	s.mu.Lock()
 	if err != nil {
 		mf = s.mountFailures[cfg.ID]
@@ -2124,6 +2360,7 @@ func (s *Service) retryRuntimeMount(rt *repoRuntime) {
 		return
 	}
 	rt.mfs = mfs
+	rt.fuse = fsint
 	delete(s.mountFailures, cfg.ID)
 	stopping := rt.stopping || rt.ctx.Err() != nil
 	if !stopping && rt.state.State == repoStateDegraded {

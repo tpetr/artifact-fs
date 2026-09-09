@@ -37,6 +37,7 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 			Usage: "start the artifact-fs daemon",
 			Flags: []ucli.Flag{
 				ucli.StringFlag{Name: "root", Value: filepath.Join(root, "mnt"), Usage: "mount root directory"},
+				ucli.StringFlag{Name: "await-repo", Usage: "pre-mount one repository and wait for add-repo registration"},
 				ucli.IntFlag{Name: "hydration-concurrency", Value: daemon.DefaultHydrationConcurrency, Usage: "number of concurrent blob hydration workers"},
 			},
 			Action: func(c *ucli.Context) error {
@@ -48,6 +49,11 @@ func Run(ctx context.Context, args []string, stdout io.Writer, stderr io.Writer)
 				defer svc.Close()
 				svc.SetMountRoot(c.String("root"))
 				svc.SetHydrationConcurrency(c.Int("hydration-concurrency"))
+				if name := strings.TrimSpace(c.String("await-repo")); name != "" {
+					if err := svc.AwaitRepo(ctx, name); err != nil {
+						return err
+					}
+				}
 				err = svc.Start(ctx)
 				if err == context.Canceled {
 					return nil
